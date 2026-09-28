@@ -1,0 +1,29 @@
+# Local Database Credentials & Private Configs
+/config.local.php
+/db_config.php
+/.env
+
+# Temporary Logs & Cache
+/*.log
+/logs/
+/cache/
+
+# User-uploaded files (guest ID photos, profile avatars, etc.)
+/uploads/
+!/uploads/.gitkeep
+
+# Operating System Metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE & Code Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dependency Folders (if using Composer or Node packages in the future)
+/vendor/
+/node_modules/
