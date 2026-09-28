@@ -85,21 +85,35 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book_room'])) {
     }
 }
 
-// 2. Handle Booking Modification
+// 2. Handle Booking Modification (room change and/or date shift, with payment difference reconciled)
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['modify_booking'])) {
     $bookingID = $_POST['bookingID'] ?? '';
+    $newRoomID = $_POST['newRoomID'] ?? '';
     $newCheckIn = $_POST['newCheckIn'] ?? '';
     $newCheckOut = $_POST['newCheckOut'] ?? '';
+    $additionalPayment = isset($_POST['additionalPayment']) ? floatval($_POST['additionalPayment']) : 0.00;
 
-    if (empty($newCheckIn) || empty($newCheckOut) || !isValidDate($newCheckIn) || !isValidDate($newCheckOut)) {
-        $message = "Error: Please provide valid modification dates.";
+    if (empty($newRoomID) || empty($newCheckIn) || empty($newCheckOut) || !isValidDate($newCheckIn) || !isValidDate($newCheckOut)) {
+        $message = "Error: Please select a room and provide valid modification dates.";
     } elseif (strtotime($newCheckIn) >= strtotime($newCheckOut)) {
         $message = "Error: New check-out date must be after new check-in date.";
     } else {
         try {
-            $stmt = $pdo->prepare("UPDATE bookings SET checkInDate = ?, checkOutDate = ? WHERE bookingID = ? AND userID = ?");
-            $stmt->execute([$newCheckIn, $newCheckOut, $bookingID, $userID]);
-            $message = "Booking dates modified successfully!";
+            $stmt = $pdo->prepare("CALL sp_ModifyBookingRoomAndDates(?, ?, ?, ?, ?, ?, @statusMessage, @priceDifference)");
+            $stmt->execute([$bookingID, $userID, $newRoomID, $newCheckIn, $newCheckOut, $additionalPayment]);
+            $stmt->closeCursor();
+
+            $out = $pdo->query("SELECT @statusMessage AS statusMessage, @priceDifference AS priceDifference")->fetch();
+            $statusText = htmlspecialchars($out['statusMessage'] ?? 'Booking modification processed.');
+            $diff = (float)($out['priceDifference'] ?? 0);
+
+            if ($diff > 0) {
+                $message = "$statusText Additional amount charged: <b>LKR " . number_format($diff, 2) . "</b>.";
+            } elseif ($diff < 0) {
+                $message = "$statusText Refund due to you: <b>LKR " . number_format(abs($diff), 2) . "</b>.";
+            } else {
+                $message = $statusText;
+            }
         } catch (PDOException $e) {
             $message = "Error: " . $e->getMessage();
         }
@@ -128,10 +142,23 @@ $stmt->execute([$max_price]);
 $rooms = $stmt->fetchAll();
 $stmt->closeCursor();
 
-// Fetch Customer's Bookings with Direct SQL Join to guarantee Room ID and Room Type are included
-$stmt2 = $pdo->prepare("SELECT b.*, r.roomType FROM bookings b LEFT JOIN rooms r ON b.roomID = r.roomID WHERE b.userID = ? ORDER BY b.bookingID DESC");
+// Fetch Customer's Bookings with Direct SQL Join to guarantee Room ID and Room Type are included,
+// plus the running total actually paid so far (needed to work out price differences on modification)
+$stmt2 = $pdo->prepare("
+    SELECT b.*, r.roomType,
+           COALESCE((SELECT SUM(amount) FROM payments WHERE bookingID = b.bookingID), 0.00) AS totalPaid
+    FROM bookings b
+    LEFT JOIN rooms r ON b.roomID = r.roomID
+    WHERE b.userID = ?
+    ORDER BY b.bookingID DESC
+");
 $stmt2->execute([$userID]);
 $my_bookings = $stmt2->fetchAll();
+
+// All rooms (any status) for the "change room" dropdown on an existing booking - the customer's
+// own current room must appear even though its status shows as Booked, not just Available ones.
+$allRoomsStmt = $pdo->query("SELECT roomID, roomType, price, status FROM rooms ORDER BY roomType, price");
+$allRoomsForModify = $allRoomsStmt->fetchAll();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -293,14 +320,44 @@ $my_bookings = $stmt2->fetchAll();
                             </td>
                             <td class="py-3.5 px-4 text-right">
                                 <?php if($isConfirmed): ?>
-                                    <div class="flex flex-col sm:flex-row items-end sm:items-center justify-end gap-1.5">
-                                        <!-- Modify Form -->
-                                        <form method="POST" class="inline-flex items-center gap-1 bg-slate-50 p-1.5 rounded-lg border border-slate-200">
+                                    <div class="flex flex-col items-end gap-1.5">
+                                        <!-- Modify Form: room, dates, and live payment-difference reconciliation -->
+                                        <form method="POST" class="modify-form flex flex-wrap items-center justify-end gap-1 bg-slate-50 p-1.5 rounded-lg border border-slate-200"
+                                              data-total-paid="<?php echo htmlspecialchars($mb['totalPaid']); ?>">
                                             <input type="hidden" name="bookingID" value="<?php echo $mb['bookingID']; ?>">
-                                            <input type="date" name="newCheckIn" value="<?php echo htmlspecialchars($mb['checkInDate']); ?>" required 
-                                                   class="border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-700 bg-white focus:ring-1 focus:ring-amber-500">
-                                            <input type="date" name="newCheckOut" value="<?php echo htmlspecialchars($mb['checkOutDate']); ?>" required 
-                                                   class="border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-700 bg-white focus:ring-1 focus:ring-amber-500">
+
+                                            <select name="newRoomID" required
+                                                    class="modify-room border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-700 bg-white focus:ring-1 focus:ring-amber-500">
+                                                <?php foreach($allRoomsForModify as $r):
+                                                    $isSameRoom = ((int)$r['roomID'] === (int)$mb['roomID']);
+                                                    // A different room can only be offered if it's not occupied right now by another in-house guest
+                                                    $disabledOpt = (!$isSameRoom && $r['status'] === 'Occupied');
+                                                ?>
+                                                <option value="<?php echo $r['roomID']; ?>"
+                                                        data-price="<?php echo htmlspecialchars($r['price']); ?>"
+                                                        <?php echo $isSameRoom ? 'selected' : ''; ?>
+                                                        <?php echo $disabledOpt ? 'disabled' : ''; ?>>
+                                                    #<?php echo $r['roomID']; ?> - <?php echo htmlspecialchars($r['roomType']); ?> (LKR <?php echo number_format($r['price'], 2); ?>/night)<?php echo $isSameRoom ? ' - current' : ''; ?>
+                                                </option>
+                                                <?php endforeach; ?>
+                                            </select>
+
+                                            <div class="flex items-center gap-1">
+                                                <span class="text-xs text-slate-500 font-medium">In:</span>
+                                                <input type="date" name="newCheckIn" value="<?php echo htmlspecialchars($mb['checkInDate']); ?>" required 
+                                                       class="modify-checkin border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-700 bg-white focus:ring-1 focus:ring-amber-500">
+                                            </div>
+                                            <div class="flex items-center gap-1">
+                                                <span class="text-xs text-slate-500 font-medium">Out:</span>
+                                                <input type="date" name="newCheckOut" value="<?php echo htmlspecialchars($mb['checkOutDate']); ?>" required 
+                                                       class="modify-checkout border border-slate-300 rounded px-1.5 py-1 text-xs text-slate-700 bg-white focus:ring-1 focus:ring-amber-500">
+                                            </div>
+
+                                            <!-- Live price-difference badge: shows extra due or refund owed for the new room/dates -->
+                                            <div class="modify-diff-display hidden items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold shadow-xs"></div>
+
+                                            <input type="hidden" name="additionalPayment" class="modify-additional-payment" value="0">
+
                                             <button type="submit" name="modify_booking" 
                                                     class="bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs px-2.5 py-1 rounded transition shadow-sm">
                                                 Modify
@@ -540,6 +597,84 @@ document.addEventListener('DOMContentLoaded', function () {
             outInput.addEventListener('change', calculateExpectedPrice);
             outInput.addEventListener('input', calculateExpectedPrice);
         }
+    });
+
+    // Modify-booking forms: live price-difference calculator (room change + date change combined)
+    document.querySelectorAll('.modify-form').forEach(form => {
+        const roomSelect = form.querySelector('.modify-room');
+        const inInput = form.querySelector('.modify-checkin');
+        const outInput = form.querySelector('.modify-checkout');
+        const diffBadge = form.querySelector('.modify-diff-display');
+        const additionalPaymentField = form.querySelector('.modify-additional-payment');
+        const totalPaid = parseFloat(form.dataset.totalPaid) || 0;
+
+        if (inInput) inInput.min = today;
+
+        function calculateDifference() {
+            const inVal = inInput ? inInput.value : '';
+            const outVal = outInput ? outInput.value : '';
+            const selectedOption = roomSelect ? roomSelect.options[roomSelect.selectedIndex] : null;
+            const roomPrice = selectedOption ? parseFloat(selectedOption.dataset.price) || 0 : 0;
+
+            if (outInput && inInput.value) {
+                outInput.min = inInput.value;
+            }
+
+            if (!inVal || !outVal) {
+                diffBadge.className = 'modify-diff-display hidden';
+                diffBadge.innerHTML = '';
+                additionalPaymentField.value = '0';
+                return;
+            }
+
+            const inDate = new Date(inVal + 'T00:00:00');
+            const outDate = new Date(outVal + 'T00:00:00');
+            const diffDays = Math.round((outDate - inDate) / 86400000);
+
+            if (diffDays <= 0) {
+                diffBadge.className = 'modify-diff-display inline-flex items-center gap-1 px-2.5 py-1 bg-red-50 border border-red-200 text-red-700 rounded-lg text-xs font-semibold shadow-xs';
+                diffBadge.innerHTML = `<i class="fa-solid fa-circle-exclamation text-red-500"></i><span>Check-out must be after check-in</span>`;
+                additionalPaymentField.value = '0';
+                return;
+            }
+
+            const newTotal = diffDays * roomPrice;
+            const priceDifference = newTotal - totalPaid;
+            const nightsText = diffDays + (diffDays === 1 ? ' night' : ' nights');
+            const formattedTotal = newTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+            if (priceDifference > 0.004) {
+                const formattedDiff = priceDifference.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                diffBadge.className = 'modify-diff-display inline-flex items-center gap-1.5 px-2.5 py-1 bg-amber-50 border border-amber-200 text-amber-900 rounded-lg text-xs font-semibold shadow-xs';
+                diffBadge.innerHTML = `
+                    <i class="fa-solid fa-receipt text-amber-600"></i>
+                    <span>New total: <b>LKR ${formattedTotal}</b> (${nightsText}) — Pay now: <b class="text-amber-950">LKR ${formattedDiff}</b></span>
+                `;
+                additionalPaymentField.value = priceDifference.toFixed(2);
+            } else if (priceDifference < -0.004) {
+                const formattedRefund = Math.abs(priceDifference).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                diffBadge.className = 'modify-diff-display inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 border border-blue-200 text-blue-900 rounded-lg text-xs font-semibold shadow-xs';
+                diffBadge.innerHTML = `
+                    <i class="fa-solid fa-rotate-left text-blue-600"></i>
+                    <span>New total: <b>LKR ${formattedTotal}</b> (${nightsText}) — Refund due: <b class="text-blue-950">LKR ${formattedRefund}</b></span>
+                `;
+                additionalPaymentField.value = '0';
+            } else {
+                diffBadge.className = 'modify-diff-display inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg text-xs font-semibold shadow-xs';
+                diffBadge.innerHTML = `
+                    <i class="fa-solid fa-check text-emerald-600"></i>
+                    <span>New total: <b>LKR ${formattedTotal}</b> (${nightsText}) — No extra payment needed</span>
+                `;
+                additionalPaymentField.value = '0';
+            }
+        }
+
+        if (roomSelect) roomSelect.addEventListener('change', calculateDifference);
+        if (inInput) inInput.addEventListener('change', calculateDifference);
+        if (outInput) outInput.addEventListener('change', calculateDifference);
+
+        // Run once on load so the badge reflects the booking's current room/dates
+        calculateDifference();
     });
 });
 </script>
