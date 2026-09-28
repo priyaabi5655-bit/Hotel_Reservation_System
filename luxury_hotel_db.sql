@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: Sep 18, 2026 at 07:34 PM
+-- Generation Time: Sep 28, 2026 at 02:32 PM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -323,40 +323,81 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_LoginUser` (IN `p_email` VARCHAR
     WHERE email = p_email;
 END$$
 
-CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_ModifyBookingDates` (IN `p_bookingID` INT, IN `p_newCheckIn` DATE, IN `p_newCheckOut` DATE, OUT `p_statusMessage` VARCHAR(100))   ha: BEGIN
-    DECLARE v_roomID INT;
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_ModifyBookingDates` (IN `p_bookingID` INT, IN `p_newRoomID` INT, IN `p_newCheckIn` DATE, IN `p_newCheckOut` DATE, OUT `p_statusMessage` VARCHAR(255))   ha: BEGIN
+    DECLARE v_oldRoomID INT;
     DECLARE v_bookingStatus VARCHAR(30);
     DECLARE v_overlap_count INT;
- 
-    SELECT roomID, bookingStatus INTO v_roomID, v_bookingStatus
+    DECLARE v_newRoomPrice DECIMAL(10,2);
+    DECLARE v_totalPaid DECIMAL(10,2);
+    DECLARE v_newNights INT;
+    DECLARE v_newTotal DECIMAL(10,2);
+    DECLARE v_newPaymentStatus VARCHAR(30);
+
+    -- Fetch current booking details
+    SELECT roomID, bookingStatus INTO v_oldRoomID, v_bookingStatus
     FROM bookings
     WHERE bookingID = p_bookingID;
- 
+
     IF v_bookingStatus = 'Confirmed' THEN
+        -- Date validation
         IF DATEDIFF(p_newCheckOut, p_newCheckIn) <= 0 THEN
             SET p_statusMessage = 'Modification failed: Invalid date range.';
             LEAVE ha;
         END IF;
- 
+
+        -- Check overlap for new room on target dates (excluding current booking ID)
         SELECT COUNT(*) INTO v_overlap_count
         FROM bookings
-        WHERE roomID = v_roomID
+        WHERE roomID = p_newRoomID
           AND bookingID != p_bookingID
           AND bookingStatus IN ('Confirmed', 'Checked-In')
           AND (p_newCheckIn < checkOutDate AND p_newCheckOut > checkInDate);
- 
-        IF v_overlap_count = 0 THEN
-            START TRANSACTION;
-            UPDATE bookings
-            SET checkInDate = p_newCheckIn, checkOutDate = p_newCheckOut
-            WHERE bookingID = p_bookingID;
-            COMMIT;
-            SET p_statusMessage = 'Booking dates modified successfully.';
-        ELSE
-            SET p_statusMessage = 'Modification failed: Room is booked for the requested new dates.';
+
+        IF v_overlap_count > 0 THEN
+            SET p_statusMessage = 'Modification failed: Target room is unavailable for selected dates.';
+            LEAVE ha;
         END IF;
+
+        -- Fetch price of new target room
+        SELECT price INTO v_newRoomPrice FROM rooms WHERE roomID = p_newRoomID;
+
+        -- Get total payments made for this booking
+        SELECT COALESCE(SUM(amount), 0.00) INTO v_totalPaid FROM payments WHERE bookingID = p_bookingID;
+
+        -- Calculate new total cost
+        SET v_newNights = DATEDIFF(p_newCheckOut, p_newCheckIn);
+        SET v_newTotal = v_newNights * v_newRoomPrice;
+
+        -- Determine payment status balance
+        IF v_totalPaid >= v_newTotal THEN
+            SET v_newPaymentStatus = 'Paid';
+        ELSE
+            SET v_newPaymentStatus = 'Advance Paid';
+        END IF;
+
+        START TRANSACTION;
+
+        -- Update booking details with new room and dates
+        UPDATE bookings
+        SET roomID = p_newRoomID,
+            checkInDate = p_newCheckIn,
+            checkOutDate = p_newCheckOut,
+            paymentStatus = v_newPaymentStatus
+        WHERE bookingID = p_bookingID;
+
+        -- Swap room availability if room ID changed
+        IF v_oldRoomID != p_newRoomID THEN
+            UPDATE rooms SET status = 'Available' WHERE roomID = v_oldRoomID;
+            UPDATE rooms SET status = 'Booked' WHERE roomID = p_newRoomID;
+        END IF;
+
+        COMMIT;
+
+        SET p_statusMessage = CONCAT('Booking updated! New Total: LKR ', FORMAT(v_newTotal, 2), 
+                                     ' | Paid: LKR ', FORMAT(v_totalPaid, 2), 
+                                     ' | Balance Due: LKR ', FORMAT(GREATEST(0, v_newTotal - v_totalPaid), 2));
     ELSE
-        SET p_statusMessage = 'Modification failed: Only confirmed bookings can be modified pre-arrival.';
+        SET p_statusMessage = 'Modification failed: Only confirmed bookings can be modified.';
     END IF;
 END$$
 
@@ -502,7 +543,13 @@ INSERT INTO `bookings` (`bookingID`, `userID`, `roomID`, `checkInDate`, `checkOu
 (50, 7, 2, '2026-09-20', '2026-09-23', 'Confirmed', 'Paid', '413481', 'N/A', '2026-09-23 23:59:59', 1, 0.00),
 (51, 9, 3, '2026-09-18', '2026-09-20', 'Completed', 'Paid', '551265', 'N/A', '2026-09-20 23:59:59', 1, 0.00),
 (52, 10, 5, '2026-09-20', '2026-09-22', 'Confirmed', 'Paid', '151924', 'N/A', '2026-09-22 23:59:59', 1, 0.00),
-(53, 10, 6, '2026-09-18', '2026-09-22', 'Cancelled', 'Paid', '954377', 'Processed', '2026-09-22 23:59:59', 1, 10.00);
+(53, 10, 6, '2026-09-18', '2026-09-22', 'Cancelled', 'Paid', '954377', 'Processed', '2026-09-22 23:59:59', 1, 10.00),
+(54, 9, 3, '2026-09-22', '2026-09-24', 'Cancelled', 'Paid', '277404', 'Processed', '2026-09-24 23:59:59', 1, 9.00),
+(55, 9, 3, '2026-09-27', '2026-09-28', 'Confirmed', 'Paid', '976692', 'N/A', '2026-09-28 23:59:59', 1, 0.00),
+(56, 9, 10, '2026-09-27', '2026-09-28', 'Cancelled', 'Paid', '413098', 'Processed', '2026-09-28 23:59:59', 1, 9.00),
+(57, 9, 10, '2026-09-27', '2026-09-28', 'Confirmed', 'Paid', '818754', 'N/A', '2026-09-28 23:59:59', 1, 0.00),
+(58, 11, 8, '2026-09-25', '2026-09-28', 'Confirmed', 'Paid', '348850', 'N/A', '2026-09-28 23:59:59', 1, 0.00),
+(59, 11, 6, '2026-09-29', '2026-09-30', 'Confirmed', 'Advance Paid', '264259', 'N/A', '2026-09-30 23:59:59', 1, 0.00);
 
 -- --------------------------------------------------------
 
@@ -593,7 +640,13 @@ INSERT INTO `payments` (`paymentID`, `bookingID`, `amount`, `paymentDate`) VALUE
 (69, 51, 90000.00, '2026-09-18 15:00:05'),
 (70, 52, 30000.00, '2026-09-18 15:17:36'),
 (71, 53, 112000.00, '2026-09-18 15:18:11'),
-(72, 51, 0.00, '2026-09-18 15:24:57');
+(72, 51, 0.00, '2026-09-18 15:24:57'),
+(73, 54, 90000.00, '2026-09-22 07:57:26'),
+(74, 55, 45000.00, '2026-09-22 08:29:54'),
+(75, 56, 15000.00, '2026-09-22 08:33:49'),
+(76, 57, 15000.00, '2026-09-22 08:42:21'),
+(77, 58, 135000.00, '2026-09-22 15:29:06'),
+(78, 59, 2800.00, '2026-09-22 15:31:05');
 
 -- --------------------------------------------------------
 
@@ -615,13 +668,14 @@ CREATE TABLE `rooms` (
 INSERT INTO `rooms` (`roomID`, `roomType`, `price`, `status`) VALUES
 (1, 'Standard Single Room', 15000.00, 'Occupied'),
 (2, 'Deluxe Double Suite', 28000.00, 'Booked'),
-(3, 'Executive Luxury Room', 45000.00, 'Available'),
+(3, 'Executive Luxury Room', 45000.00, 'Booked'),
 (4, 'Standard Single Room', 15000.00, 'Occupied'),
 (5, 'Standard Single Room', 15000.00, 'Booked'),
-(6, 'Deluxe Double Suite', 28000.00, 'Available'),
+(6, 'Deluxe Double Suite', 28000.00, 'Booked'),
 (7, 'Deluxe Double Suite', 28000.00, 'Available'),
-(8, 'Executive Luxury Room', 45000.00, 'Available'),
-(9, 'Executive Luxury Room', 45000.00, 'Available');
+(8, 'Executive Luxury Room', 45000.00, 'Booked'),
+(9, 'Executive Luxury Room', 45000.00, 'Available'),
+(10, 'Standard Single Room', 15000.00, 'Booked');
 
 -- --------------------------------------------------------
 
@@ -651,7 +705,8 @@ INSERT INTO `users` (`userID`, `name`, `email`, `password`, `role`) VALUES
 (7, 'beyah', 'beyah@gmail.com', '$2y$10$N/Kyvw7BxJCxk7cx5pvOXu8PUIyBCSbdigJxGaxyNtKYKwKf1s7GS', 'Customer'),
 (8, 'David Cooper', 'David@gmail.com', '$2y$10$BCJwwN6dDdwOM62RoLu3Be4uDOjHKWVYdvrGf/p01dLlAs9IWwL.2', 'Receptionist'),
 (9, 'Merina', 'Merina123@gmail.com', '$2y$10$gOrzl6RVbQ89bk7zNfYy6.KsV/pYQnv7ok8KMr.zRvUF7Jq2SLaFe', 'Customer'),
-(10, 'Sahasvi', 'Sahasvi2003@gmail.com', '$2y$10$EFPs2Dig/VkDWPlM/5d55.v9N4K4Fo5S6.l54iNgl0S2a7YWsRjle', 'Customer');
+(10, 'Sahasvi', 'Sahasvi2003@gmail.com', '$2y$10$EFPs2Dig/VkDWPlM/5d55.v9N4K4Fo5S6.l54iNgl0S2a7YWsRjle', 'Customer'),
+(11, 'hinaza umarali', 'hina@gmail.com', '$2y$10$bsVArqhC6pbyw02C3U9dL.qpav42WJdpMcw1HADkmExTTEVVqGyyi', 'Customer');
 
 --
 -- Indexes for dumped tables
@@ -695,25 +750,25 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT for table `bookings`
 --
 ALTER TABLE `bookings`
-  MODIFY `bookingID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=54;
+  MODIFY `bookingID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=60;
 
 --
 -- AUTO_INCREMENT for table `payments`
 --
 ALTER TABLE `payments`
-  MODIFY `paymentID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=73;
+  MODIFY `paymentID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=79;
 
 --
 -- AUTO_INCREMENT for table `rooms`
 --
 ALTER TABLE `rooms`
-  MODIFY `roomID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=10;
+  MODIFY `roomID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
 
 --
 -- AUTO_INCREMENT for table `users`
 --
 ALTER TABLE `users`
-  MODIFY `userID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
+  MODIFY `userID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
 
 --
 -- Constraints for dumped tables
